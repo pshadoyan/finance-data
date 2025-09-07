@@ -229,6 +229,269 @@ Configurable rate limiting per worker:
 - Adjustable via `POLYGON_RATE_LIMIT` env var
 - Automatic backoff on 429 errors
 
+## Customizing Pipeline Parameters 🎛️
+
+### Quick Start Customization
+
+The pipeline is designed to be easily customizable based on your system resources and API limits. Here are the most common adjustments:
+
+```bash
+# For testing (low resource usage)
+make run  # Default: 100 tickers, 6 workers
+
+# For production (full dataset)
+make run-full  # All tickers, batch processing
+
+# Custom ticker limit
+docker-compose run --rm app python -m app.cli discover us_equities --limit 500
+```
+
+### Worker Configuration
+
+#### Adjusting Worker Count
+
+The default configuration runs 6 workers (1 discovery + 5 download). To scale:
+
+**Method 1: Add More Workers**
+
+Edit `docker-compose.yml` and duplicate a worker block:
+
+```yaml
+worker-6:
+  build:
+    context: .
+    dockerfile: Dockerfile
+  container_name: finance-worker-6
+  env_file:
+    - .env
+  volumes:
+    - ./data:/data
+    - ./universe:/universe
+    - ./app:/app/app:ro
+  depends_on:
+    redis:
+      condition: service_healthy
+  networks:
+    - finance-network
+  environment:
+    - DOCKER_ENV=true
+    - CELERY_BROKER_URL=redis://redis:6379/0
+    - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    - C_FORCE_ROOT=true
+  command: celery -A app.celery_app worker --loglevel=info --concurrency=2 -Q download,default -n worker6@%h
+  deploy:
+    resources:
+      limits:
+        cpus: '1'
+        memory: 1G
+```
+
+Then update the `Makefile` to include the new workers:
+
+```makefile
+workers:
+	@echo "👷 Starting all workers..."
+	docker-compose up -d worker-discovery worker-1 worker-2 worker-3 worker-4 worker-5 worker-6
+	@echo "✅ Started 7 workers:"
+```
+
+**Method 2: Scale Existing Workers**
+
+```bash
+# Run multiple instances of the same worker
+docker-compose up -d --scale worker-1=3
+```
+
+#### Adjusting Concurrency
+
+Each worker's concurrency setting controls parallel task execution:
+
+```yaml
+# In docker-compose.yml, modify the command:
+command: celery -A app.celery_app worker --loglevel=info --concurrency=4 -Q download,default -n worker1@%h
+#                                                         ^^^^^^^^^^^^^^^^
+```
+
+**Recommended Concurrency Settings:**
+
+| System Resources | Workers | Concurrency | Total Tasks |
+|-----------------|---------|-------------|-------------|
+| Low (2-4 cores) | 2-3 | 1 | 2-3 |
+| Medium (8-16 cores) | 4-6 | 2 | 8-12 |
+| High (20+ cores) | 8-10 | 3-4 | 24-40 |
+
+#### Resource Limits
+
+Control CPU and memory allocation per worker:
+
+```yaml
+# In docker-compose.yml under each worker:
+deploy:
+  resources:
+    limits:
+      cpus: '2'      # Number of CPU cores
+      memory: 2G     # RAM allocation
+```
+
+### Performance Optimization Profiles
+
+#### Profile 1: Free Tier / Testing
+```yaml
+# Optimized for Polygon.io free tier (5 requests/minute)
+Workers: 2
+Concurrency: 1
+CPU per worker: 0.5
+Memory: 512M
+Rate limit: 5/min
+```
+
+```bash
+# Implementation:
+# 1. Set in .env:
+POLYGON_RATE_LIMIT=5
+WORKER_CONCURRENCY=1
+
+# 2. Reduce workers in Makefile:
+docker-compose up -d worker-discovery worker-1
+```
+
+#### Profile 2: Standard / Paid Tier
+```yaml
+<code_block_to_apply_changes_from>
+```
+
+```bash
+# This is the default configuration
+make run
+```
+
+#### Profile 3: High Performance
+```yaml
+# Maximum throughput (1000+ requests/minute)
+Workers: 10
+Concurrency: 4
+CPU per worker: 2
+Memory: 2G
+Rate limit: 1000/min
+```
+
+```bash
+# Implementation:
+# 1. Add workers 6-9 in docker-compose.yml
+# 2. Increase concurrency to 4
+# 3. Update CPU/memory limits
+# 4. Set in .env:
+POLYGON_RATE_LIMIT=1000
+WORKER_CONCURRENCY=4
+```
+
+### Batch Processing Control
+
+Fine-tune how tickers are processed:
+
+```bash
+# Process specific batch ranges
+make enqueue-batch BATCH_SIZE=50 START_BATCH=0 MAX_BATCHES=20
+
+# Add delays to respect rate limits
+make enqueue-batch DELAY=30  # 30 seconds between batches
+
+# Custom batch processing
+docker-compose run --rm app python -m app.cli enqueue-batch \
+  universe/us_equities_*.json \
+  --batch-size 25 \
+  --start-batch 10 \
+  --max-batches 5 \
+  --delay 60
+```
+
+### Environment Variables
+
+Create custom configurations using environment variables:
+
+```bash
+# .env.production
+POLYGON_API_KEY=your_key
+POLYGON_RATE_LIMIT=500
+WORKER_CONCURRENCY=3
+WORKER_MAX_TASKS_PER_CHILD=200
+BATCH_SIZE=100
+
+# Use custom environment
+docker-compose --env-file .env.production up
+```
+
+### Monitoring & Tuning
+
+Track performance after adjustments:
+
+```bash
+# Real-time resource usage
+docker stats
+
+# Queue depth monitoring
+watch -n 5 'docker-compose exec -T redis redis-cli LLEN celery'
+
+# Worker throughput
+docker-compose logs worker-1 | grep "succeeded in" | tail -20
+
+# Task completion rate (Flower UI)
+make flower  # Navigate to Tasks tab
+
+# System health check
+make status
+```
+
+### Optimization Decision Tree
+
+```
+Start Here
+    ↓
+How many API requests/minute allowed?
+    ├─ 5 (Free) → Use 2 workers, concurrency=1
+    ├─ 100-500 → Use 4-6 workers, concurrency=2
+    └─ 1000+ → Use 8-10 workers, concurrency=3-4
+        ↓
+How many CPU cores available?
+    ├─ <4 → Limit to 2-3 workers
+    ├─ 8-16 → Use 4-6 workers
+    └─ 20+ → Scale to 10+ workers
+        ↓
+How much RAM available?
+    ├─ <4GB → 512MB per worker
+    ├─ 8-16GB → 1GB per worker
+    └─ 32GB+ → 2GB per worker
+```
+
+### Common Scenarios
+
+#### Scenario: "I'm hitting rate limits"
+```bash
+# Reduce concurrent requests
+- Decrease worker count to 2-3
+- Set concurrency=1
+- Add delays: TASK_DELAY=5
+- Lower POLYGON_RATE_LIMIT in .env
+```
+
+#### Scenario: "Workers are idle"
+```bash
+# Increase throughput
+- Add more workers (up to 10)
+- Increase concurrency (up to 4)
+- Remove CPU limits
+- Check queue depth: tasks might be bottlenecked elsewhere
+```
+
+#### Scenario: "System running out of memory"
+```bash
+# Optimize memory usage
+- Reduce worker_max_tasks_per_child to 50
+- Limit memory per worker to 512MB
+- Process smaller batches
+- Reduce concurrency
+```
+
 ## Troubleshooting 🔍
 
 ### Common Issues
