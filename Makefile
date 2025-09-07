@@ -52,43 +52,68 @@ stop:
 	@echo "⏸️  Pausing services..."
 	docker-compose stop
 
-# Full pipeline run (test mode with 100 tickers)
+# Full pipeline run with equities, crypto, and ETFs
 run: up
-	@echo "🎯 Starting full pipeline with parallel processing (TEST MODE - 100 tickers)..."
+	@echo "🎯 Starting full pipeline with parallel processing (Equities + Crypto + ETFs)..."
 	@sleep 5
 	@echo ""
-	@echo "👷 Step 1: Starting 6 parallel workers..."
-	docker-compose up -d worker-discovery worker-1 worker-2 worker-3 worker-4 worker-5
-	@echo "   ✓ 1 discovery worker + 5 download workers started"
-	@echo ""
-	@echo "📊 Step 2: Discovering US equities (limited to 100 for demo)..."
-	docker-compose run --rm app python -m app.cli discover us_equities --limit 100
-	@echo ""
-	@echo "📥 Step 3: Enqueueing parallel discovery/download jobs..."
-	@UNIVERSE_FILE=$$(ls -t universe/us_equities_*.json 2>/dev/null | head -1); \
-	if [ -n "$$UNIVERSE_FILE" ]; then \
-		echo "   Using universe file: $$UNIVERSE_FILE"; \
-		echo "   Each ticker will:"; \
-		echo "     1. Discover all available timeframes (1m,5m,15m,30m,1h,2h,4h,1d,1w,1M,1Q,1Y)"; \
-		echo "     2. Spawn parallel download tasks for each timeframe"; \
-		docker-compose run --rm app python -m app.cli enqueue $$UNIVERSE_FILE \
-			--async; \
+	@echo "🔍 Checking for leftover tasks..."
+	@QUEUE_SIZE=$$(docker-compose exec -T redis redis-cli -h redis LLEN celery 2>/dev/null || echo "0"); \
+	if [ "$$QUEUE_SIZE" != "0" ] && [ "$$QUEUE_SIZE" != "" ]; then \
+		echo "   ⚠️  Found $$QUEUE_SIZE leftover tasks in queue!"; \
+		echo "   Clearing old tasks..."; \
+		docker-compose exec -T redis redis-cli FLUSHDB >/dev/null 2>&1; \
+		echo "   ✅ Queue cleared"; \
 	else \
-		echo "❌ No universe file found. Run 'make discover' first."; \
+		echo "   ✅ Queue is clean"; \
 	fi
 	@echo ""
-	@echo "✅ Pipeline started with 6 parallel workers!"
+	@echo "👷 Step 1: Starting 10 parallel workers..."
+	docker-compose up -d worker-discovery worker-1 worker-2 worker-3 worker-4 worker-5 worker-6 worker-7 worker-8 worker-9
+	@echo "   ✓ 1 discovery worker + 9 download workers started"
+	@echo ""
+	@echo "📊 Step 2: Discovering tickers..."
+	@echo "   📈 Discovering US equities (limited to 100 for demo)..."
+	docker-compose run --rm app python -m app.cli discover us_equities --limit 100
+	@echo "   🪙 Discovering crypto (limited to 50)..."
+	docker-compose run --rm app python -m app.cli discover crypto --limit 50
+	@echo "   📊 Discovering ALL ETFs..."
+	docker-compose run --rm app python -m app.cli discover etf
+	@echo ""
+	@echo "📥 Step 3: Enqueueing parallel discovery/download jobs..."
+	@echo "   Processing US Equities..."
+	@UNIVERSE_FILE=$$(ls -t universe/us_equities_*.json 2>/dev/null | head -1); \
+	if [ -n "$$UNIVERSE_FILE" ]; then \
+		echo "   Using universe file: $$UNIVERSE_FILE (batch size: 100)"; \
+		docker-compose run --rm app python -m app.cli enqueue $$UNIVERSE_FILE --async --batch-size 100; \
+	fi
+	@echo "   Processing Crypto..."
+	@UNIVERSE_FILE=$$(ls -t universe/crypto_*.json 2>/dev/null | head -1); \
+	if [ -n "$$UNIVERSE_FILE" ]; then \
+		echo "   Using universe file: $$UNIVERSE_FILE (batch size: 100)"; \
+		docker-compose run --rm app python -m app.cli enqueue $$UNIVERSE_FILE --async --batch-size 100; \
+	fi
+	@echo "   Processing ETFs..."
+	@UNIVERSE_FILE=$$(ls -t universe/etf_*.json 2>/dev/null | head -1); \
+	if [ -n "$$UNIVERSE_FILE" ]; then \
+		echo "   Using universe file: $$UNIVERSE_FILE (batch size: 100)"; \
+		docker-compose run --rm app python -m app.cli enqueue $$UNIVERSE_FILE --async --batch-size 100; \
+	fi
+	@echo ""
+	@echo "✅ Pipeline started with 10 workers!"
+	@echo "   Processing: Equities + Crypto + ETFs"
 	@echo "   Monitor progress at http://localhost:5555"
-	@echo "   Run 'make logs' to see worker output"
+	@echo "   Check queue: make queue-status"
+	@echo "   View logs: make logs"
 
 # Full production pipeline (ALL equities in batches)
 run-full: up
 	@echo "🚀 Starting FULL pipeline with ALL US equities..."
 	@sleep 5
 	@echo ""
-	@echo "👷 Step 1: Starting 6 parallel workers..."
-	docker-compose up -d worker-discovery worker-1 worker-2 worker-3 worker-4 worker-5
-	@echo "   ✓ 1 discovery worker + 5 download workers started"
+	@echo "👷 Step 1: Starting 10 parallel workers..."
+	docker-compose up -d worker-discovery worker-1 worker-2 worker-3 worker-4 worker-5 worker-6 worker-7 worker-8 worker-9
+	@echo "   ✓ 1 discovery worker + 9 download workers started"
 	@echo ""
 	@echo "📊 Step 2: Discovering ALL US equities (up to 15k tickers)..."
 	docker-compose run --rm app python -m app.cli discover-all
@@ -98,6 +123,7 @@ run-full: up
 	if [ -n "$$UNIVERSE_FILE" ]; then \
 		echo "   Using universe file: $$UNIVERSE_FILE"; \
 		echo "   Processing first 10 batches (1000 tickers)..."; \
+		echo "   Note: Tasks will automatically check existing data and skip up-to-date files"; \
 		echo "   Run 'make enqueue-batch START_BATCH=10' to continue with next batches"; \
 		docker-compose run --rm app python -m app.cli enqueue-batch $$UNIVERSE_FILE \
 			--batch-size 100 \
@@ -112,13 +138,40 @@ run-full: up
 	@echo "   Monitor progress at http://localhost:5555"
 	@echo "   Continue with: make enqueue-batch START_BATCH=10"
 
-# Run all workers (6 total: 1 discovery + 5 download)
+# Verify what would be downloaded (use the verify-pipeline command)
+check-pipeline:
+	@echo "🔍 Checking what the pipeline would do..."
+	@UNIVERSE_FILE=$$(ls -t universe/us_equities_*.json 2>/dev/null | head -1); \
+	if [ -n "$$UNIVERSE_FILE" ]; then \
+		echo "   Using universe file: $$UNIVERSE_FILE"; \
+		docker-compose run --rm app python -m app.cli verify-pipeline $$UNIVERSE_FILE \
+			--dry-run --limit 20; \
+	else \
+		echo "❌ No universe file found. Run 'make discover' first."; \
+	fi
+
+# Force refresh (bypass automatic smart checking)
+run-force:
+	@echo "⚠️  WARNING: Force refresh will re-download ALL data!"
+	@read -p "Are you sure you want to bypass smart checking? (y/n) " -n 1 -r; \
+	echo ""; \
+	if [[ $$REPLY =~ ^[Yy]$$ ]]; then \
+		@UNIVERSE_FILE=$$(ls -t universe/us_equities_*.json 2>/dev/null | head -1); \
+		if [ -n "$$UNIVERSE_FILE" ]; then \
+			docker-compose run --rm app python -m app.cli enqueue $$UNIVERSE_FILE \
+				--async --force-refresh; \
+		fi \
+	else \
+		echo "Cancelled."; \
+	fi
+
+# Run all workers (10 total: 1 discovery + 9 download)
 workers:
 	@echo "👷 Starting all workers..."
-	docker-compose up -d worker-discovery worker-1 worker-2 worker-3 worker-4 worker-5
-	@echo "✅ Started 6 workers:"
+	docker-compose up -d worker-discovery worker-1 worker-2 worker-3 worker-4 worker-5 worker-6 worker-7 worker-8 worker-9
+	@echo "✅ Started 10 workers:"
 	@echo "   - 1 discovery worker (handles timeframe discovery)"
-	@echo "   - 5 download workers (parallel downloads)"
+	@echo "   - 9 download workers (parallel downloads)"
 	@echo "   Monitor at http://localhost:5555"
 
 # Run a single worker (for development)
@@ -182,9 +235,31 @@ discover-full:
 discover-all:
 	@echo "🔍 Discovering all categories..."
 	docker-compose run --rm app python -m app.cli discover us_equities --limit 100
-	docker-compose run --rm app python -m app.cli discover etf --limit 100
+	docker-compose run --rm app python -m app.cli discover etf
 	docker-compose run --rm app python -m app.cli discover crypto --limit 50
 	docker-compose run --rm app python -m app.cli discover fx --limit 25
+
+# Run crypto pipeline
+run-crypto:
+	@echo "🪙 Starting crypto pipeline..."
+	@echo "Discovering crypto tickers..."
+	docker-compose run --rm app python -m app.cli discover crypto --limit 100
+	@UNIVERSE_FILE=$$(ls -t universe/crypto_*.json 2>/dev/null | head -1); \
+	if [ -n "$$UNIVERSE_FILE" ]; then \
+		echo "Enqueueing crypto download tasks..."; \
+		docker-compose run --rm app python -m app.cli enqueue $$UNIVERSE_FILE --async; \
+	fi
+
+# Run ETF pipeline
+run-etf:
+	@echo "📊 Starting ETF pipeline..."
+	@echo "Discovering ALL ETF tickers..."
+	docker-compose run --rm app python -m app.cli discover etf
+	@UNIVERSE_FILE=$$(ls -t universe/etf_*.json 2>/dev/null | head -1); \
+	if [ -n "$$UNIVERSE_FILE" ]; then \
+		echo "Enqueueing ETF download tasks..."; \
+		docker-compose run --rm app python -m app.cli enqueue $$UNIVERSE_FILE --async; \
+	fi
 
 # Enqueue jobs with auto-detection
 enqueue:
@@ -228,6 +303,43 @@ enqueue-custom:
 		echo "❌ No universe file found. Run 'make discover' first."; \
 	fi
 
+# Queue management commands
+queue-status:
+	@echo "📊 Checking Celery queue status..."
+	@echo ""
+	@echo "📈 Queue lengths:"
+	@docker-compose exec -T redis redis-cli LLEN celery | xargs echo "   Default queue (celery):"
+	@docker-compose exec -T redis redis-cli LLEN discovery | xargs echo "   Discovery queue:"
+	@docker-compose exec -T redis redis-cli LLEN download | xargs echo "   Download queue:"
+	@docker-compose exec -T redis redis-cli LLEN default | xargs echo "   Default tasks:"
+	@echo ""
+	@echo "🔄 Active tasks:"
+	@docker-compose run --rm app celery -A app.celery_app inspect active --timeout=2 2>/dev/null || echo "   No active tasks or workers not running"
+	@echo ""
+	@echo "⏳ Reserved tasks:"
+	@docker-compose run --rm app celery -A app.celery_app inspect reserved --timeout=2 2>/dev/null || echo "   No reserved tasks or workers not running"
+
+queue-clear:
+	@echo "⚠️  WARNING: This will clear ALL pending tasks from the queue!"
+	@read -p "Are you sure? (y/n) " -n 1 -r; \
+	echo ""; \
+	if [[ $$REPLY =~ ^[Yy]$$ ]]; then \
+		echo "🧹 Clearing all queues..."; \
+		docker-compose exec -T redis redis-cli DEL celery; \
+		docker-compose exec -T redis redis-cli DEL discovery; \
+		docker-compose exec -T redis redis-cli DEL download; \
+		docker-compose exec -T redis redis-cli DEL default; \
+		docker-compose exec -T redis redis-cli FLUSHDB; \
+		echo "✅ All queues cleared!"; \
+	else \
+		echo "Cancelled."; \
+	fi
+
+queue-purge:
+	@echo "🧹 Purging all tasks from Celery..."
+	docker-compose run --rm app celery -A app.celery_app purge -f
+	@echo "✅ All tasks purged!"
+
 # Check status
 status:
 	@echo "📊 System Status"
@@ -269,6 +381,21 @@ test-ticker-custom:
 list-universes:
 	@echo "📋 Available universes:"
 	@docker-compose run --rm app python -m app.cli list-universes
+
+# Safe run that checks queue first
+run-clean: queue-status
+	@echo ""
+	@QUEUE_SIZE=$$(docker-compose exec -T redis redis-cli LLEN celery 2>/dev/null || echo "0"); \
+	if [ "$$QUEUE_SIZE" -gt "0" ]; then \
+		echo "⚠️  Found $$QUEUE_SIZE tasks in queue from previous run!"; \
+		read -p "Clear queue before starting? (y/n) " -n 1 -r; \
+		echo ""; \
+		if [[ $$REPLY =~ ^[Yy]$$ ]]; then \
+			$(MAKE) queue-clear; \
+		fi; \
+	fi
+	@echo ""
+	$(MAKE) run
 
 # Development mode - mount code for live reload
 dev:

@@ -17,14 +17,15 @@ logger = logging.getLogger(__name__)
 class DataDownloader:
     """Main downloader class with resume capabilities."""
     
-    def __init__(self, polygon_client: PolygonClient, data_dir: str = "/data"):
+    def __init__(self, polygon_client: PolygonClient, data_dir: str = "/data", asset_type: str = "equities"):
         self.client = polygon_client
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(exist_ok=True, parents=True)
+        self.asset_type = asset_type  # Can be "equities", "crypto", "etf", etc.
         
     def _get_ticker_dir(self, ticker: str) -> Path:
         """Get the directory for a specific ticker."""
-        ticker_dir = self.data_dir / "equities" / ticker.upper()
+        ticker_dir = self.data_dir / self.asset_type / ticker.upper()
         ticker_dir.mkdir(parents=True, exist_ok=True)
         return ticker_dir
     

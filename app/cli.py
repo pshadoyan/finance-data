@@ -101,13 +101,17 @@ def discover(ctx, category, limit, output_dir, append):
               help='Force refresh of all data (ignore existing)')
 @click.option('--async', 'use_async', is_flag=True,
               help='Use Celery for async processing')
+@click.option('--skip-existing/--no-skip-existing', default=True,
+              help='Skip tickers that already have data (default: True)')
 @click.pass_context
 def enqueue(ctx, universe_file, timeframes, start, end, output_format, 
-           batch_size, force_refresh, use_async):
+           batch_size, force_refresh, use_async, skip_existing):
     """
     Enqueue download jobs for a universe of tickers.
     
     UNIVERSE_FILE: Path to universe JSON file created by discover command
+    
+    By default, skips tickers that already have recent data.
     
     Examples:
         python -m app.cli enqueue universe/us_equities_20241201.json
@@ -123,7 +127,7 @@ def enqueue(ctx, universe_file, timeframes, start, end, output_format,
         if os.path.exists("/.dockerenv") or os.environ.get("HOSTNAME"):
             # Running in Docker - convert host path to container path
             if universe_file.startswith('universe/'):
-                universe_file = '/universe/' + universe_file[9:]  # Remove 'universe/' prefix and add '/universe/'
+                universe_file = '/universe/' + universe_file[9:]
         
         # Validate universe file exists
         if not Path(universe_file).exists():
@@ -131,13 +135,103 @@ def enqueue(ctx, universe_file, timeframes, start, end, output_format,
             exit(1)
         
         # Load universe to get ticker count
-        # Use /universe when running in Docker
         universe_dir = "/universe" if os.path.exists("/.dockerenv") or os.environ.get("HOSTNAME") else "universe"
         polygon_client = PolygonClient(api_key, calls_per_minute=5)
         universe_manager = UniverseManager(polygon_client, universe_dir)
         tickers = universe_manager.get_ticker_list(universe_file)
         
-        click.echo(f"📊 Enqueueing jobs for {len(tickers)} tickers")
+        original_count = len(tickers)
+        click.echo(f"📊 Processing {original_count} tickers from universe")
+        
+        # Pre-filter tickers if skip_existing is enabled and not forcing refresh
+        if skip_existing and not force_refresh and use_async:
+            click.echo("🔍 Pre-checking existing data to skip up-to-date tickers...")
+            
+            import pandas as pd
+            from datetime import datetime
+            
+            data_dir = Path("/data") if os.path.exists("/.dockerenv") else Path("data")
+            
+            tickers_to_process = []
+            tickers_skipped = []
+            
+            # Quick check each ticker
+            with click.progressbar(tickers, label='Pre-filtering', show_pos=True) as ticker_progress:
+                for ticker in ticker_progress:
+                    ticker_dir = data_dir / "equities" / ticker
+                    
+                    # Check if we have any data for this ticker
+                    needs_processing = True
+                    
+                    if ticker_dir.exists():
+                        parquet_files = list(ticker_dir.glob("*.parquet"))
+                        
+                        if parquet_files:
+                            # We have some data - check if it's recent
+                            # Quick heuristic: if we have multiple timeframe files and they're recent, skip
+                            if len(parquet_files) >= 3:  # Has at least 3 timeframes
+                                try:
+                                    # Check the age of the most recent file
+                                    import time
+                                    newest_file = max(parquet_files, key=lambda p: p.stat().st_mtime)
+                                    file_age_hours = (time.time() - newest_file.stat().st_mtime) / 3600
+                                    
+                                    # If data is less than 24 hours old and we have multiple timeframes, skip
+                                    if file_age_hours < 24:
+                                        needs_processing = False
+                                        tickers_skipped.append(ticker)
+                                    
+                                    # For more thorough check on older files
+                                    elif file_age_hours < 72:  # Less than 3 days old
+                                        # Do a quick content check on one file
+                                        try:
+                                            df = pd.read_parquet(newest_file, columns=['timestamp'])
+                                            if not df.empty:
+                                                df['timestamp'] = pd.to_datetime(df['timestamp']) 
+                                                last_timestamp = df['timestamp'].max()
+                                                days_old = (pd.Timestamp.now() - last_timestamp).days
+                                                
+                                                # Skip if data is less than 2 days old
+                                                if days_old < 2:
+                                                    needs_processing = False
+                                                    tickers_skipped.append(ticker)
+                                        except:
+                                            pass  # If we can't read, assume it needs processing
+                                except:
+                                    pass  # Any error, assume needs processing
+                    
+                    if needs_processing:
+                        tickers_to_process.append(ticker)
+            
+            # Report filtering results
+            click.echo(f"\n📊 Pre-filter Results:")
+            click.echo(f"   ✅ Skipped (up-to-date): {len(tickers_skipped)} tickers")
+            click.echo(f"   📥 Need processing: {len(tickers_to_process)} tickers")
+            
+            if len(tickers_skipped) > 0:
+                click.echo(f"\n   Skipping {len(tickers_skipped)} tickers with recent data")
+                if len(tickers_skipped) <= 10:
+                    click.echo(f"   Examples: {', '.join(tickers_skipped[:10])}")
+                else:
+                    click.echo(f"   Examples: {', '.join(tickers_skipped[:10])}...")
+            
+            # Check if we have anything to process
+            if len(tickers_to_process) == 0:
+                click.echo(f"\n✅ All {original_count} tickers appear to have recent data!")
+                click.echo("   No tasks to enqueue.")
+                click.echo("   Use --force-refresh to re-download anyway.")
+                return
+            
+            # Update the ticker list
+            tickers = tickers_to_process
+            click.echo(f"\n📥 Enqueueing tasks for {len(tickers)} tickers that need updates")
+        else:
+            if force_refresh:
+                click.echo("⚠️  Force refresh mode: Will re-download all data")
+            elif not skip_existing:
+                click.echo("📥 Processing all tickers (skip-existing disabled)")
+        
+        # Show what we're doing
         if intervals:
             click.echo(f"   Timeframes: {', '.join(intervals)}")
         else:
@@ -152,7 +246,7 @@ def enqueue(ctx, universe_file, timeframes, start, end, output_format,
             from app.tasks import backfill_symbol, discover_and_download_ticker
             
             # Decide whether to use parallel discovery or direct download
-            use_parallel = (intervals is None or not intervals)  # Use parallel if auto-detecting
+            use_parallel = (intervals is None or not intervals)
             
             # Enqueue individual tasks for each ticker
             task_ids = []
@@ -162,7 +256,8 @@ def enqueue(ctx, universe_file, timeframes, start, end, output_format,
                         # Use the new parallel discovery and download task
                         task = discover_and_download_ticker.delay(
                             ticker=ticker,
-                            api_key=api_key
+                            api_key=api_key,
+                            check_existing=not force_refresh
                         )
                     else:
                         # Use traditional backfill when specific intervals are provided
@@ -180,6 +275,10 @@ def enqueue(ctx, universe_file, timeframes, start, end, output_format,
             
             if use_parallel:
                 click.echo(f"✅ Enqueued {len(task_ids)} parallel discovery tasks")
+                if skip_existing and not force_refresh:
+                    saved_tasks = original_count - len(task_ids)
+                    if saved_tasks > 0:
+                        click.echo(f"   💰 Saved {saved_tasks} unnecessary tasks by pre-filtering!")
                 click.echo(f"   Each ticker will discover timeframes and spawn download tasks")
             else:
                 click.echo(f"✅ Enqueued {len(task_ids)} download tasks")
@@ -519,6 +618,256 @@ def enqueue_batch(universe_file: str, batch_size: int, start_batch: int, max_bat
     except Exception as e:
         click.echo(f"❌ Batch processing failed: {e}", err=True)
         raise click.Abort()
+
+
+@cli.command()
+@click.argument('universe_file', type=click.Path(exists=True))
+@click.option('--dry-run', is_flag=True, help='Check what would be downloaded without actually downloading')
+@click.option('--limit', '-l', type=int, help='Limit number of tickers to check')
+def verify_pipeline(universe_file, dry_run, limit):
+    """
+    Verify what the pipeline would do with current data state.
+    
+    Shows which tickers/timeframes are:
+    - Already up to date
+    - Need updates
+    - Would be downloaded fresh
+    
+    Example:
+        python -m app.cli verify-pipeline universe/us_equities_20241201.json --dry-run
+    """
+    from pathlib import Path
+    import json
+    import pandas as pd
+    
+    # Load universe
+    with open(universe_file, 'r') as f:
+        universe_data = json.load(f)
+    
+    tickers = universe_data.get('tickers', [])
+    if limit:
+        tickers = tickers[:limit]
+    
+    if not tickers:
+        click.echo("❌ No tickers found in universe file")
+        return
+    
+    click.echo(f"🔍 Verifying pipeline for {len(tickers)} tickers...")
+    click.echo(f"   Mode: {'DRY RUN (no downloads)' if dry_run else 'LIVE CHECK'}\n")
+    
+    # Initialize client
+    api_key = os.getenv('POLYGON_API_KEY')
+    if not api_key:
+        click.echo("❌ POLYGON_API_KEY not set")
+        return
+    
+    from app.polygon_client import PolygonClient
+    client = PolygonClient(api_key, calls_per_minute=10)
+    
+    data_dir = Path("/data") if os.path.exists("/.dockerenv") else Path("data")
+    
+    # Statistics
+    stats = {
+        'tickers_complete': 0,
+        'tickers_partial': 0,
+        'tickers_missing': 0,
+        'timeframes_up_to_date': 0,
+        'timeframes_need_update': 0,
+        'timeframes_missing': 0,
+        'total_tasks_needed': 0
+    }
+    
+    detailed_results = []
+    
+    for ticker in tickers:
+        ticker_dir = data_dir / "equities" / ticker
+        
+        # Discover available timeframes
+        timeframe_info = client.detect_available_timeframes(ticker)
+        
+        if not timeframe_info.get('available_timeframes'):
+            stats['tickers_missing'] += 1
+            detailed_results.append({
+                'ticker': ticker,
+                'status': 'no_api_data',
+                'message': 'No data available from API'
+            })
+            continue
+        
+        ticker_stats = {
+            'up_to_date': [],
+            'needs_update': [],
+            'missing': []
+        }
+        
+        for timeframe, info in timeframe_info['available_timeframes'].items():
+            file_path = ticker_dir / f"{ticker}.{timeframe}.parquet"
+            
+            if file_path.exists():
+                try:
+                    df = pd.read_parquet(file_path, columns=['timestamp'])
+                    if not df.empty:
+                        df['timestamp'] = pd.to_datetime(df['timestamp'])
+                        last_local = df['timestamp'].max()
+                        api_end = pd.to_datetime(info['end_date'])
+                        
+                        days_behind = (api_end - last_local).days
+                        
+                        if days_behind <= 0:
+                            ticker_stats['up_to_date'].append(timeframe)
+                            stats['timeframes_up_to_date'] += 1
+                        else:
+                            ticker_stats['needs_update'].append(f"{timeframe} ({days_behind}d behind)")
+                            stats['timeframes_need_update'] += 1
+                            stats['total_tasks_needed'] += 1
+                    else:
+                        ticker_stats['missing'].append(timeframe)
+                        stats['timeframes_missing'] += 1
+                        stats['total_tasks_needed'] += 1
+                except:
+                    ticker_stats['missing'].append(timeframe)
+                    stats['timeframes_missing'] += 1
+                    stats['total_tasks_needed'] += 1
+            else:
+                ticker_stats['missing'].append(timeframe)
+                stats['timeframes_missing'] += 1
+                stats['total_tasks_needed'] += 1
+        
+        # Classify ticker status
+        if len(ticker_stats['missing']) == 0 and len(ticker_stats['needs_update']) == 0:
+            stats['tickers_complete'] += 1
+            status = '✅ COMPLETE'
+        elif len(ticker_stats['missing']) == len(timeframe_info['available_timeframes']):
+            stats['tickers_missing'] += 1
+            status = '❌ MISSING'
+        else:
+            stats['tickers_partial'] += 1
+            status = '⚠️  PARTIAL'
+        
+        detailed_results.append({
+            'ticker': ticker,
+            'status': status,
+            'up_to_date': ticker_stats['up_to_date'],
+            'needs_update': ticker_stats['needs_update'],
+            'missing': ticker_stats['missing']
+        })
+        
+        # Show progress
+        if len(detailed_results) % 10 == 0:
+            click.echo(f"   Checked {len(detailed_results)}/{len(tickers)} tickers...")
+    
+    # Display results
+    click.echo("\n" + "="*60)
+    click.echo("📊 PIPELINE VERIFICATION SUMMARY")
+    click.echo("="*60)
+    
+    click.echo(f"\n🎯 Ticker Status:")
+    click.echo(f"   ✅ Complete (all up-to-date): {stats['tickers_complete']}")
+    click.echo(f"   ⚠️  Partial (some updates):    {stats['tickers_partial']}")
+    click.echo(f"   ❌ Missing (no local data):   {stats['tickers_missing']}")
+    
+    click.echo(f"\n📈 Timeframe Status:")
+    click.echo(f"   ✅ Up to date:    {stats['timeframes_up_to_date']}")
+    click.echo(f"   🔄 Need update:   {stats['timeframes_need_update']}")
+    click.echo(f"   ❌ Missing:       {stats['timeframes_missing']}")
+    
+    click.echo(f"\n🚀 Pipeline Impact:")
+    if stats['total_tasks_needed'] == 0:
+        click.echo(f"   ✅ ALL DATA IS UP TO DATE!")
+        click.echo(f"   No download tasks would be created.")
+    else:
+        click.echo(f"   📥 Tasks to be created: {stats['total_tasks_needed']}")
+        click.echo(f"   This includes {stats['timeframes_need_update']} updates and {stats['timeframes_missing']} new downloads")
+    
+    # Show some detailed examples
+    if detailed_results:
+        click.echo(f"\n📋 Sample Details (first 5):")
+        for result in detailed_results[:5]:
+            click.echo(f"\n   {result['ticker']}: {result['status']}")
+            if result['up_to_date']:
+                click.echo(f"      ✅ Up to date: {', '.join(result['up_to_date'])}")
+            if result['needs_update']:
+                click.echo(f"      🔄 Needs update: {', '.join(result['needs_update'])}")
+            if result['missing']:
+                click.echo(f"      ❌ Missing: {', '.join(result['missing'])}")
+    
+    if not dry_run and stats['total_tasks_needed'] > 0:
+        click.echo(f"\n💡 To download missing/outdated data, run:")
+        click.echo(f"   make enqueue")
+
+
+@cli.command()
+def queue_status():
+    """Check the status of Celery queues."""
+    try:
+        import redis
+        import json
+        
+        # Connect to Redis
+        r = redis.Redis(host='redis' if os.path.exists("/.dockerenv") else 'localhost', port=6379, db=0)
+        
+        # Check queue lengths
+        queues = {
+            'celery': r.llen('celery'),
+            'discovery': r.llen('discovery'),
+            'download': r.llen('download'),
+            'default': r.llen('default')
+        }
+        
+        click.echo("📊 Queue Status:")
+        total_tasks = 0
+        for queue_name, length in queues.items():
+            if length > 0:
+                click.echo(f"   {queue_name}: {length} tasks")
+                total_tasks += length
+        
+        if total_tasks == 0:
+            click.echo("   ✅ All queues are empty")
+        else:
+            click.echo(f"\n   Total: {total_tasks} pending tasks")
+            
+            # Show a sample of tasks
+            sample_tasks = r.lrange('celery', 0, 2)
+            if sample_tasks:
+                click.echo("\n   Sample tasks:")
+                for task_data in sample_tasks[:3]:
+                    try:
+                        task = json.loads(task_data)
+                        click.echo(f"     - {task.get('headers', {}).get('task', 'unknown')}")
+                    except:
+                        pass
+        
+    except Exception as e:
+        click.echo(f"❌ Error checking queue: {e}")
+
+
+@cli.command()
+@click.option('--force', is_flag=True, help='Force clear without confirmation')
+def queue_clear(force):
+    """Clear all pending tasks from Celery queues."""
+    if not force:
+        if not click.confirm("⚠️  This will clear ALL pending tasks. Continue?"):
+            click.echo("Cancelled.")
+            return
+    
+    try:
+        import redis
+        
+        # Connect to Redis
+        r = redis.Redis(host='redis' if os.path.exists("/.dockerenv") else 'localhost', port=6379, db=0)
+        
+        # Clear all queues
+        deleted = 0
+        for queue in ['celery', 'discovery', 'download', 'default']:
+            deleted += r.delete(queue)
+        
+        # Also flush the entire database to clear any other Celery data
+        r.flushdb()
+        
+        click.echo(f"✅ Cleared all queues")
+        
+    except Exception as e:
+        click.echo(f"❌ Error clearing queue: {e}")
 
 
 if __name__ == '__main__':

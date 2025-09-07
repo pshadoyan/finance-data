@@ -10,20 +10,78 @@ from app.celery_app import app
 from app.polygon_client import PolygonClient
 from app.downloader import DataDownloader
 from app.universe import UniverseManager
+from pathlib import Path
+import pandas as pd
+from datetime import datetime, timedelta
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def detect_asset_type(ticker: str, polygon_client: PolygonClient = None) -> str:
+    """
+    Detect asset type from ticker symbol.
+    
+    Returns: 'crypto', 'etf', or 'equities'
+    """
+    ticker = ticker.upper()
+    
+    # Common crypto patterns
+    if ticker.startswith('X:') or ticker.endswith('USD') or ticker.endswith('USDT'):
+        return 'crypto'
+    
+    # Check if it's in common crypto list
+    common_crypto = ['BTC', 'ETH', 'BNB', 'XRP', 'ADA', 'DOGE', 'SOL', 'DOT', 'MATIC', 
+                     'SHIB', 'AVAX', 'LINK', 'UNI', 'ATOM', 'LTC', 'ETC', 'XLM', 'ALGO']
+    if ticker in common_crypto or any(ticker.startswith(c) for c in common_crypto):
+        return 'crypto'
+    
+    # Common ETF patterns - many ETFs are 3-4 letters and end with specific patterns
+    etf_patterns = ['SPY', 'QQQ', 'IWM', 'EEM', 'GLD', 'SLV', 'USO', 'TLT', 'XLF', 'XLE', 
+                    'XLK', 'XLI', 'XLV', 'XLY', 'XLP', 'XLU', 'XLB', 'XLRE', 'VTI', 'VOO',
+                    'VEA', 'VWO', 'AGG', 'BND', 'LQD', 'HYG', 'EMB', 'TIP', 'SHY', 'IEF']
+    if ticker in etf_patterns:
+        return 'etf'
+    
+    # ETFs often have these suffixes
+    if any(ticker.endswith(suffix) for suffix in ['ETF', 'ETN', 'ETV', 'FUND']):
+        return 'etf'
+    
+    # If we have a polygon client, we can check the API
+    if polygon_client:
+        try:
+            # Try to get ticker details
+            details = polygon_client.get_ticker_details(ticker)
+            if details:
+                ticker_type = details.get('type', '').upper()
+                market = details.get('market', '').upper()
+                
+                if 'CRYPTO' in market or 'CRYPTO' in ticker_type:
+                    return 'crypto'
+                elif 'ETF' in ticker_type or 'ETP' in ticker_type:
+                    return 'etf'
+        except:
+            pass
+    
+    # Default to equities
+    return 'equities'
 
 
 @app.task(bind=True, name='app.tasks.discover_and_download_ticker')
 def discover_and_download_ticker(
     self,
     ticker: str,
-    api_key: Optional[str] = None
+    api_key: Optional[str] = None,
+    check_existing: bool = True  # New parameter to enable smart checking
 ) -> Dict[str, Any]:
     """
-    Discover available timeframes for a ticker and enqueue download tasks.
-    This is the main entry point for parallel processing per equity.
+    Intelligently discover and download only missing or outdated data.
+    
+    This task:
+    1. Discovers available timeframes from API
+    2. Checks what's already downloaded locally
+    3. Only enqueues tasks for missing or outdated data
+    4. Returns summary of what was done
     """
     try:
         # Update task state
@@ -53,31 +111,132 @@ def discover_and_download_ticker(
                 'timeframes_found': 0
             }
         
-        # Enqueue download task for each timeframe
-        download_tasks = []
-        for timeframe, info in timeframe_info['available_timeframes'].items():
-            task = download_single_timeframe.delay(
-                ticker=ticker,
-                interval=timeframe,
-                start_date=info['start_date'],
-                end_date=info['end_date'],
-                api_key=api_key
-            )
-            download_tasks.append({
-                'task_id': task.id,
-                'timeframe': timeframe,
-                'date_range': f"{info['start_date']} to {info['end_date']}"
-            })
-            logger.info(f"Enqueued download for {ticker} {timeframe}")
+        # Check existing data if enabled
+        data_dir = Path("/data") if os.path.exists("/.dockerenv") else Path("data")
+        ticker_dir = data_dir / "equities" / ticker
         
-        return {
+        download_tasks = []
+        skipped_timeframes = []
+        needs_update = []
+        new_timeframes = []
+        
+        for timeframe, info in timeframe_info['available_timeframes'].items():
+            file_path = ticker_dir / f"{ticker}.{timeframe}.parquet"
+            
+            # Check if we should skip this timeframe
+            skip_reason = None
+            needs_download = True
+            
+            if check_existing and file_path.exists():
+                try:
+                    # Read just the timestamp column for efficiency
+                    df = pd.read_parquet(file_path, columns=['timestamp'])
+                    
+                    if not df.empty:
+                        df['timestamp'] = pd.to_datetime(df['timestamp'])
+                        last_local_timestamp = df['timestamp'].max()
+                        
+                        # Check if data is current
+                        api_end_date = pd.to_datetime(info['end_date'])
+                        
+                        # Calculate how old the data is
+                        days_behind = (api_end_date - last_local_timestamp).days
+                        
+                        if days_behind <= 0:
+                            # Data is up to date
+                            skip_reason = f"already up to date (last: {last_local_timestamp.date()})"
+                            needs_download = False
+                            skipped_timeframes.append({
+                                'timeframe': timeframe,
+                                'reason': skip_reason,
+                                'records': len(df),
+                                'last_timestamp': str(last_local_timestamp)
+                            })
+                        elif days_behind <= 1:
+                            # Data is very recent, might just be missing today's data
+                            needs_update.append({
+                                'timeframe': timeframe,
+                                'days_behind': days_behind,
+                                'last_local': str(last_local_timestamp),
+                                'api_end': info['end_date']
+                            })
+                        else:
+                            # Data needs significant update
+                            needs_update.append({
+                                'timeframe': timeframe,
+                                'days_behind': days_behind,
+                                'last_local': str(last_local_timestamp),
+                                'api_end': info['end_date']
+                            })
+                    else:
+                        # File exists but is empty
+                        logger.warning(f"Empty file for {ticker} {timeframe}, will re-download")
+                        
+                except Exception as e:
+                    logger.warning(f"Could not check existing data for {ticker} {timeframe}: {e}")
+            else:
+                # New timeframe that doesn't exist locally
+                new_timeframes.append(timeframe)
+            
+            # Enqueue download task if needed
+            if needs_download:
+                task = download_single_timeframe.delay(
+                    ticker=ticker,
+                    interval=timeframe,
+                    start_date=info['start_date'],
+                    end_date=info['end_date'],
+                    api_key=api_key
+                )
+                download_tasks.append({
+                    'task_id': task.id,
+                    'timeframe': timeframe,
+                    'date_range': f"{info['start_date']} to {info['end_date']}"
+                })
+                logger.info(f"Enqueued download for {ticker} {timeframe}")
+        
+        # Prepare detailed response
+        result = {
             'task_id': self.request.id,
             'ticker': ticker,
-            'status': 'downloads_enqueued',
-            'timeframes_found': len(timeframe_info['available_timeframes']),
-            'download_tasks': download_tasks,
-            'timeframe_details': timeframe_info['available_timeframes']
+            'status': 'completed',
+            'summary': {
+                'timeframes_available': len(timeframe_info['available_timeframes']),
+                'timeframes_skipped': len(skipped_timeframes),
+                'timeframes_to_update': len(needs_update),
+                'timeframes_new': len(new_timeframes),
+                'tasks_created': len(download_tasks)
+            }
         }
+        
+        # Add details if there are any
+        if skipped_timeframes:
+            result['skipped'] = skipped_timeframes
+            logger.info(f"{ticker}: Skipped {len(skipped_timeframes)} up-to-date timeframes")
+        
+        if needs_update:
+            result['updates_needed'] = needs_update
+            logger.info(f"{ticker}: {len(needs_update)} timeframes need updates")
+        
+        if new_timeframes:
+            result['new_timeframes'] = new_timeframes
+            logger.info(f"{ticker}: {len(new_timeframes)} new timeframes to download")
+        
+        if download_tasks:
+            result['download_tasks'] = download_tasks
+        
+        # Set appropriate status message
+        if len(download_tasks) == 0:
+            result['status'] = 'all_up_to_date'
+            result['message'] = f"All {len(timeframe_info['available_timeframes'])} timeframes are already up to date"
+            logger.info(f"✅ {ticker}: All data is up to date, no downloads needed")
+        elif len(download_tasks) < len(timeframe_info['available_timeframes']):
+            result['status'] = 'partial_update'
+            result['message'] = f"Updating {len(download_tasks)} of {len(timeframe_info['available_timeframes'])} timeframes"
+        else:
+            result['status'] = 'full_download'
+            result['message'] = f"Downloading all {len(download_tasks)} timeframes"
+        
+        return result
         
     except Exception as e:
         logger.error(f"Failed to discover/enqueue for {ticker}: {e}")
@@ -125,9 +284,13 @@ def download_single_timeframe(
         # Each worker gets its own rate limit allocation
         polygon_client = PolygonClient(api_key, calls_per_minute=2)  # Conservative for parallel
         
+        # Detect asset type
+        asset_type = detect_asset_type(ticker, polygon_client)
+        logger.info(f"Detected asset type for {ticker}: {asset_type}")
+        
         # Use simplified data directory structure
         data_dir = "/data" if os.path.exists("/.dockerenv") else "data"
-        downloader = DataDownloader(polygon_client, data_dir=data_dir)
+        downloader = DataDownloader(polygon_client, data_dir=data_dir, asset_type=asset_type)
         
         logger.info(f"Worker downloading {ticker} {interval} from {start_date} to {end_date}")
         
@@ -213,7 +376,12 @@ def backfill_symbol(
         
         # Initialize clients with rate limiting for worker safety
         polygon_client = PolygonClient(api_key, calls_per_minute=3)
-        downloader = DataDownloader(polygon_client)
+        
+        # Detect asset type
+        asset_type = detect_asset_type(ticker, polygon_client)
+        logger.info(f"Detected asset type for {ticker}: {asset_type}")
+        
+        downloader = DataDownloader(polygon_client, data_dir="/data" if os.path.exists("/.dockerenv") else "data", asset_type=asset_type)
         
         logger.info(f"Task {self.request.id}: Starting backfill for {ticker}")
         
