@@ -1,0 +1,500 @@
+"""
+Celery tasks for distributed data downloading.
+"""
+
+import os
+import logging
+from typing import List, Dict, Any, Optional
+from celery import current_task
+from app.celery_app import app
+from app.polygon_client import PolygonClient
+from app.downloader import DataDownloader
+from app.universe import UniverseManager
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+@app.task(bind=True, name='app.tasks.discover_and_download_ticker')
+def discover_and_download_ticker(
+    self,
+    ticker: str,
+    api_key: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Discover available timeframes for a ticker and enqueue download tasks.
+    This is the main entry point for parallel processing per equity.
+    """
+    try:
+        # Update task state
+        self.update_state(
+            state='PROGRESS',
+            meta={'ticker': ticker, 'status': 'discovering timeframes', 'progress': 0}
+        )
+        
+        # Get API key
+        api_key = api_key or os.getenv('POLYGON_API_KEY')
+        if not api_key:
+            raise ValueError("POLYGON_API_KEY not provided")
+        
+        # Initialize client with conservative rate limit for discovery
+        polygon_client = PolygonClient(api_key, calls_per_minute=10)
+        
+        # Discover available timeframes
+        logger.info(f"Discovering timeframes for {ticker}")
+        timeframe_info = polygon_client.detect_available_timeframes(ticker)
+        
+        if not timeframe_info.get('available_timeframes'):
+            logger.warning(f"No timeframes available for {ticker}")
+            return {
+                'task_id': self.request.id,
+                'ticker': ticker,
+                'status': 'no_data',
+                'timeframes_found': 0
+            }
+        
+        # Enqueue download task for each timeframe
+        download_tasks = []
+        for timeframe, info in timeframe_info['available_timeframes'].items():
+            task = download_single_timeframe.delay(
+                ticker=ticker,
+                interval=timeframe,
+                start_date=info['start_date'],
+                end_date=info['end_date'],
+                api_key=api_key
+            )
+            download_tasks.append({
+                'task_id': task.id,
+                'timeframe': timeframe,
+                'date_range': f"{info['start_date']} to {info['end_date']}"
+            })
+            logger.info(f"Enqueued download for {ticker} {timeframe}")
+        
+        return {
+            'task_id': self.request.id,
+            'ticker': ticker,
+            'status': 'downloads_enqueued',
+            'timeframes_found': len(timeframe_info['available_timeframes']),
+            'download_tasks': download_tasks,
+            'timeframe_details': timeframe_info['available_timeframes']
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to discover/enqueue for {ticker}: {e}")
+        return {
+            'task_id': self.request.id,
+            'ticker': ticker,
+            'status': 'error',
+            'error': str(e)
+        }
+
+
+@app.task(bind=True, name='app.tasks.download_single_timeframe')
+def download_single_timeframe(
+    self,
+    ticker: str,
+    interval: str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    output_format: str = "parquet",
+    force_refresh: bool = False,
+    api_key: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Download data for a single ticker and timeframe.
+    This task is designed to be run in parallel across multiple workers.
+    """
+    try:
+        # Update task state
+        self.update_state(
+            state='PROGRESS',
+            meta={
+                'ticker': ticker,
+                'interval': interval,
+                'status': 'downloading',
+                'progress': 0
+            }
+        )
+        
+        # Get API key
+        api_key = api_key or os.getenv('POLYGON_API_KEY')
+        if not api_key:
+            raise ValueError("POLYGON_API_KEY not provided")
+        
+        # Initialize clients with rate limiting
+        # Each worker gets its own rate limit allocation
+        polygon_client = PolygonClient(api_key, calls_per_minute=2)  # Conservative for parallel
+        
+        # Use simplified data directory structure
+        data_dir = "/data" if os.path.exists("/.dockerenv") else "data"
+        downloader = DataDownloader(polygon_client, data_dir=data_dir)
+        
+        logger.info(f"Worker downloading {ticker} {interval} from {start_date} to {end_date}")
+        
+        # Auto-detect dates if not provided
+        auto_detect_range = (start_date is None or end_date is None)
+        
+        result = downloader.download_symbol_data(
+            ticker=ticker,
+            interval=interval,
+            start_date=start_date,
+            end_date=end_date,
+            output_format=output_format,
+            force_refresh=force_refresh,
+            auto_detect_range=auto_detect_range
+        )
+        
+        # Organize the file if downloaded successfully
+        if result.get('status') == 'success' and result.get('file_path'):
+            from pathlib import Path
+            from app.data_organizer import DataOrganizer
+            
+            organizer = DataOrganizer(base_dir=data_dir)
+            source_file = Path(result['file_path'])
+            
+            if source_file.exists():
+                organized_path = organizer.organize_downloaded_file(
+                    source_file=source_file,
+                    symbol=ticker,
+                    interval=interval,
+                    market_type='stocks'
+                )
+                result['organized_path'] = str(organized_path)
+                
+                # Clean up empty ticker directory if it exists
+                ticker_dir = Path(data_dir) / ticker
+                if ticker_dir.exists() and ticker_dir.is_dir():
+                    try:
+                        ticker_dir.rmdir()  # Only removes if empty
+                    except OSError:
+                        pass
+        
+        logger.info(f"Completed download for {ticker} {interval}: {result.get('status')}")
+        
+        return {
+            'task_id': self.request.id,
+            'ticker': ticker,
+            'interval': interval,
+            'status': result.get('status', 'unknown'),
+            'records': result.get('records', 0),
+            'file_path': result.get('organized_path', result.get('file_path')),
+            'date_range': f"{start_date or 'auto'} to {end_date or 'auto'}"
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to download {ticker} {interval}: {e}")
+        return {
+            'task_id': self.request.id,
+            'ticker': ticker,
+            'interval': interval,
+            'status': 'error',
+            'error': str(e)
+        }
+
+
+@app.task(bind=True, name='app.tasks.backfill_symbol')
+def backfill_symbol(
+    self,
+    ticker: str,
+    intervals: Optional[List[str]] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    output_format: str = "parquet",
+    force_refresh: bool = False,
+    auto_detect: bool = True,
+    organize: bool = True,
+    api_key: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Celery task to download historical data for a single symbol.
+    
+    Args:
+        ticker: Stock ticker symbol
+        intervals: List of time intervals (auto-detected if None)
+        start_date: Start date (auto-detected if None)
+        end_date: End date (auto-detected if None)
+        output_format: Output format (parquet or csv)
+        force_refresh: Force refresh of all data
+        auto_detect: Auto-detect timeframes and date ranges
+        organize: Use DataOrganizer to structure output
+        api_key: Polygon API key (optional, uses env var if not provided)
+    
+    Returns:
+        Dict with task results
+    """
+    try:
+        # Update task state
+        self.update_state(
+            state='PROGRESS',
+            meta={'ticker': ticker, 'status': 'starting', 'progress': 0}
+        )
+        
+        # Get API key from parameter or environment
+        api_key = api_key or os.getenv('POLYGON_API_KEY')
+        if not api_key:
+            raise ValueError("POLYGON_API_KEY not provided")
+        
+        # Initialize clients with rate limiting for worker safety
+        polygon_client = PolygonClient(api_key, calls_per_minute=3)
+        downloader = DataDownloader(polygon_client)
+        
+        logger.info(f"Task {self.request.id}: Starting backfill for {ticker}")
+        
+        # Use comprehensive download if auto-detecting everything
+        if auto_detect and intervals is None and organize:
+            self.update_state(
+                state='PROGRESS',
+                meta={
+                    'ticker': ticker,
+                    'status': 'auto-detecting available data',
+                    'progress': 10
+                }
+            )
+            
+            result = downloader.download_all_available_data(
+                ticker=ticker,
+                output_format=output_format,
+                force_refresh=force_refresh,
+                organize=organize
+            )
+            
+            if result['status'] == 'completed':
+                logger.info(f"Task {self.request.id}: Downloaded all available data for {ticker}")
+                return {
+                    'task_id': self.request.id,
+                    'ticker': ticker,
+                    'status': 'completed',
+                    'method': 'comprehensive',
+                    'result': result
+                }
+            else:
+                logger.warning(f"Task {self.request.id}: No data available for {ticker}")
+                return {
+                    'task_id': self.request.id,
+                    'ticker': ticker,
+                    'status': 'no_data',
+                    'result': result
+                }
+        
+        # Otherwise use the multi-interval download with auto-detection
+        results = downloader.download_multiple_intervals(
+            ticker=ticker,
+            intervals=intervals,
+            start_date=start_date,
+            end_date=end_date,
+            output_format=output_format,
+            force_refresh=force_refresh,
+            auto_detect_timeframes=(intervals is None)
+        )
+        
+        # Count successes
+        success_count = sum(1 for r in results if r.get('status') == 'success')
+        total_intervals = len([r for r in results if r.get('status') != 'timeframe_detection'])
+        
+        # Final status
+        success_count = sum(1 for r in results if r['status'] == 'success')
+        
+        final_result = {
+            'task_id': self.request.id,
+            'ticker': ticker,
+            'status': 'completed',
+            'intervals_completed': success_count,
+            'intervals_total': total_intervals,
+            'results': results,
+            'start_date': start_date,
+            'end_date': end_date
+        }
+        
+        logger.info(f"Task {self.request.id}: Backfill complete for {ticker} - {success_count}/{total_intervals} intervals")
+        return final_result
+        
+    except Exception as e:
+        error_msg = f"Task {self.request.id}: Failed to backfill {ticker}: {str(e)}"
+        logger.error(error_msg)
+        
+        self.update_state(
+            state='FAILURE',
+            meta={
+                'ticker': ticker,
+                'status': 'error',
+                'error': str(e)
+            }
+        )
+        
+        return {
+            'task_id': self.request.id,
+            'ticker': ticker,
+            'status': 'error',
+            'error': str(e)
+        }
+
+
+@app.task(bind=True, name='app.tasks.discover_universe')
+def discover_universe(
+    self,
+    category: str,
+    limit: Optional[int] = None,
+    api_key: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Celery task to discover ticker universe for a category.
+    
+    Args:
+        category: Category name (us_equities, etf, crypto, etc.)
+        limit: Maximum number of tickers to discover
+        api_key: Polygon API key
+    
+    Returns:
+        Dict with discovery results
+    """
+    try:
+        self.update_state(
+            state='PROGRESS',
+            meta={'category': category, 'status': 'starting', 'progress': 0}
+        )
+        
+        # Get API key
+        api_key = api_key or os.getenv('POLYGON_API_KEY')
+        if not api_key:
+            raise ValueError("POLYGON_API_KEY not provided")
+        
+        # Initialize clients
+        polygon_client = PolygonClient(api_key, calls_per_minute=5)
+        universe_manager = UniverseManager(polygon_client)
+        
+        logger.info(f"Task {self.request.id}: Starting universe discovery for {category}")
+        
+        result = universe_manager.discover_category(category, limit)
+        
+        logger.info(f"Task {self.request.id}: Universe discovery complete for {category}")
+        
+        return {
+            'task_id': self.request.id,
+            'category': category,
+            'status': 'completed',
+            'result': result
+        }
+        
+    except Exception as e:
+        error_msg = f"Task {self.request.id}: Failed to discover {category}: {str(e)}"
+        logger.error(error_msg)
+        
+        self.update_state(
+            state='FAILURE',
+            meta={
+                'category': category,
+                'status': 'error',
+                'error': str(e)
+            }
+        )
+        
+        return {
+            'task_id': self.request.id,
+            'category': category,
+            'status': 'error',
+            'error': str(e)
+        }
+
+
+@app.task(bind=True, name='app.tasks.bulk_enqueue_backfills')
+def bulk_enqueue_backfills(
+    self,
+    universe_file: str,
+    intervals: List[str],
+    start_date: str,
+    end_date: str,
+    output_format: str = "parquet",
+    batch_size: int = 10,
+    force_refresh: bool = False
+) -> Dict[str, Any]:
+    """
+    Celery task to bulk enqueue backfill tasks for a universe.
+    
+    Args:
+        universe_file: Path to universe JSON file
+        intervals: List of intervals to download
+        start_date: Start date (YYYY-MM-DD)
+        end_date: End date (YYYY-MM-DD)
+        output_format: Output format
+        batch_size: Number of tasks to enqueue at once
+        force_refresh: Force refresh all data
+    
+    Returns:
+        Dict with enqueue results
+    """
+    try:
+        self.update_state(
+            state='PROGRESS',
+            meta={'status': 'loading universe', 'progress': 0}
+        )
+        
+        # Load universe
+        polygon_client = PolygonClient(os.getenv('POLYGON_API_KEY', ''), calls_per_minute=5)
+        universe_manager = UniverseManager(polygon_client)
+        tickers = universe_manager.get_ticker_list(universe_file)
+        
+        logger.info(f"Task {self.request.id}: Bulk enqueueing {len(tickers)} tickers")
+        
+        task_ids = []
+        total_tickers = len(tickers)
+        
+        # Enqueue in batches
+        for i in range(0, total_tickers, batch_size):
+            batch = tickers[i:i + batch_size]
+            
+            self.update_state(
+                state='PROGRESS',
+                meta={
+                    'status': f'enqueueing batch {i//batch_size + 1}',
+                    'progress': int((i / total_tickers) * 100)
+                }
+            )
+            
+            for ticker in batch:
+                task = backfill_symbol.delay(
+                    ticker=ticker,
+                    intervals=intervals,
+                    start_date=start_date,
+                    end_date=end_date,
+                    output_format=output_format,
+                    force_refresh=force_refresh
+                )
+                task_ids.append(task.id)
+            
+            logger.info(f"Task {self.request.id}: Enqueued batch {i//batch_size + 1} ({len(batch)} tasks)")
+        
+        result = {
+            'task_id': self.request.id,
+            'status': 'completed',
+            'universe_file': universe_file,
+            'total_tasks_enqueued': len(task_ids),
+            'task_ids': task_ids[:100],  # Limit task IDs in response
+            'total_task_ids': len(task_ids)
+        }
+        
+        logger.info(f"Task {self.request.id}: Bulk enqueue complete - {len(task_ids)} tasks")
+        return result
+        
+    except Exception as e:
+        error_msg = f"Task {self.request.id}: Failed to bulk enqueue: {str(e)}"
+        logger.error(error_msg)
+        
+        return {
+            'task_id': self.request.id,
+            'status': 'error',
+            'error': str(e)
+        }
+
+
+@app.task(name='app.tasks.cleanup_old_results')
+def cleanup_old_results() -> Dict[str, Any]:
+    """
+    Periodic task to clean up old task results.
+    """
+    try:
+        # This would typically clean up old result files, logs, etc.
+        logger.info("Cleanup task completed")
+        return {'status': 'completed', 'action': 'cleanup'}
+    except Exception as e:
+        logger.error(f"Cleanup task failed: {e}")
+        return {'status': 'error', 'error': str(e)}

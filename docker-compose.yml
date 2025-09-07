@@ -1,0 +1,230 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: finance-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - finance-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: finance-app
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+      - ./universe:/universe
+      - ./app:/app/app:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - finance-network
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    command: python -m app.cli --help
+
+  # Worker for discovery tasks (1 instance)
+  worker-discovery:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: finance-worker-discovery
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+      - ./universe:/universe
+      - ./app:/app/app:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - finance-network
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - C_FORCE_ROOT=true
+    command: celery -A app.celery_app worker --loglevel=info --concurrency=2 -Q discovery -n discovery@%h
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+
+  # Download workers (5 instances)
+  worker-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: finance-worker-1
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+      - ./universe:/universe
+      - ./app:/app/app:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - finance-network
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - C_FORCE_ROOT=true
+    command: celery -A app.celery_app worker --loglevel=info --concurrency=2 -Q download,default -n worker1@%h
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+
+  worker-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: finance-worker-2
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+      - ./universe:/universe
+      - ./app:/app/app:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - finance-network
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - C_FORCE_ROOT=true
+    command: celery -A app.celery_app worker --loglevel=info --concurrency=2 -Q download,default -n worker2@%h
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+
+  worker-3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: finance-worker-3
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+      - ./universe:/universe
+      - ./app:/app/app:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - finance-network
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - C_FORCE_ROOT=true
+    command: celery -A app.celery_app worker --loglevel=info --concurrency=2 -Q download,default -n worker3@%h
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+
+  worker-4:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: finance-worker-4
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+      - ./universe:/universe
+      - ./app:/app/app:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - finance-network
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - C_FORCE_ROOT=true
+    command: celery -A app.celery_app worker --loglevel=info --concurrency=2 -Q download,default -n worker4@%h
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+
+  worker-5:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: finance-worker-5
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+      - ./universe:/universe
+      - ./app:/app/app:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - finance-network
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - C_FORCE_ROOT=true
+    command: celery -A app.celery_app worker --loglevel=info --concurrency=2 -Q download,default -n worker5@%h
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+
+  flower:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: finance-flower
+    env_file:
+      - .env
+    ports:
+      - "5555:5555"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - finance-network
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    command: celery -A app.celery_app flower --port=5555
+
+networks:
+  finance-network:
+    driver: bridge
+
+volumes:
+  redis_data:
+    driver: local
