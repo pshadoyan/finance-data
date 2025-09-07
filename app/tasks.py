@@ -144,30 +144,7 @@ def download_single_timeframe(
             auto_detect_range=auto_detect_range
         )
         
-        # Organize the file if downloaded successfully
-        if result.get('status') == 'success' and result.get('file_path'):
-            from pathlib import Path
-            from app.data_organizer import DataOrganizer
-            
-            organizer = DataOrganizer(base_dir=data_dir)
-            source_file = Path(result['file_path'])
-            
-            if source_file.exists():
-                organized_path = organizer.organize_downloaded_file(
-                    source_file=source_file,
-                    symbol=ticker,
-                    interval=interval,
-                    market_type='stocks'
-                )
-                result['organized_path'] = str(organized_path)
-                
-                # Clean up empty ticker directory if it exists
-                ticker_dir = Path(data_dir) / ticker
-                if ticker_dir.exists() and ticker_dir.is_dir():
-                    try:
-                        ticker_dir.rmdir()  # Only removes if empty
-                    except OSError:
-                        pass
+        # Data is already saved to the correct location (equities/TICKER/)
         
         logger.info(f"Completed download for {ticker} {interval}: {result.get('status')}")
         
@@ -177,7 +154,7 @@ def download_single_timeframe(
             'interval': interval,
             'status': result.get('status', 'unknown'),
             'records': result.get('records', 0),
-            'file_path': result.get('organized_path', result.get('file_path')),
+            'file_path': result.get('file_path'),
             'date_range': f"{start_date or 'auto'} to {end_date or 'auto'}"
         }
         
@@ -216,7 +193,7 @@ def backfill_symbol(
         output_format: Output format (parquet or csv)
         force_refresh: Force refresh of all data
         auto_detect: Auto-detect timeframes and date ranges
-        organize: Use DataOrganizer to structure output
+        organize: Deprecated parameter (kept for compatibility)
         api_key: Polygon API key (optional, uses env var if not provided)
     
     Returns:

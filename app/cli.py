@@ -87,11 +87,11 @@ def discover(ctx, category, limit, output_dir, append):
 @click.option('--timeframes', '-t', default=None, 
               help='Comma-separated timeframes (1m,5m,15m,1h,1d) or leave empty for auto-detect')
 @click.option('--start', '-s', 
-              default=(datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d'),
-              help='Start date (YYYY-MM-DD)')
+              default=None,
+              help='Start date (YYYY-MM-DD) - leave empty to get ALL available history')
 @click.option('--end', '-e', 
-              default=datetime.now().strftime('%Y-%m-%d'),
-              help='End date (YYYY-MM-DD)')
+              default=None,
+              help='End date (YYYY-MM-DD) - leave empty for current date')
 @click.option('--output-format', '-f', default='parquet', 
               type=click.Choice(['parquet', 'csv']),
               help='Output format')
@@ -396,6 +396,129 @@ def status(ticker, interval):
     except Exception as e:
         click.echo(f"❌ Error: {str(e)}")
         exit(1)
+
+
+@cli.command('discover-all')
+@click.option('--append/--no-append', default=True, help='Append to existing universe file')
+def discover_all(append: bool):
+    """Discover ALL available US equities (up to 15k) from Polygon API."""
+    click.echo("🔍 Discovering ALL US equities (this may take a few minutes)...")
+    
+    # Get API key from environment
+    api_key = os.getenv('POLYGON_API_KEY')
+    if not api_key:
+        click.echo("❌ POLYGON_API_KEY not found in environment", err=True)
+        raise click.Abort()
+    
+    # Determine universe directory based on environment
+    if os.getenv('DOCKER_ENV'):
+        universe_dir = "/universe"
+    else:
+        universe_dir = "universe"
+    
+    # Initialize PolygonClient first
+    polygon_client = PolygonClient(api_key)
+    manager = UniverseManager(polygon_client, universe_dir=universe_dir)
+    
+    try:
+        # Discover ALL US equities (no limit)
+        result = manager.discover_category('us_equities', limit=None, append=append)
+        click.echo(f"✅ Successfully discovered {result['count']} US equities")
+        click.echo(f"   New tickers added: {result.get('new_tickers_added', 0)}")
+        click.echo(f"   Saved to: {result['file_path']}")
+        
+        # Show sample tickers
+        if result['count'] > 0:
+            click.echo(f"\n📊 Sample tickers (first 10):")
+            with open(result['file_path'], 'r') as f:
+                data = json.load(f)
+                for ticker in data['tickers'][:10]:
+                    click.echo(f"   - {ticker['ticker']}: {ticker['name']}")
+            if result['count'] > 10:
+                click.echo(f"   ... and {result['count'] - 10} more")
+    
+    except Exception as e:
+        click.echo(f"❌ Discovery failed: {e}", err=True)
+        raise click.Abort()
+
+
+@cli.command('enqueue-batch')
+@click.argument('universe_file', type=click.Path(exists=True))
+@click.option('--batch-size', type=int, default=100, help='Number of tickers per batch')
+@click.option('--start-batch', type=int, default=0, help='Starting batch number (0-indexed)')
+@click.option('--max-batches', type=int, help='Maximum number of batches to process')
+@click.option('--delay', type=int, default=5, help='Delay in seconds between batches')
+def enqueue_batch(universe_file: str, batch_size: int, start_batch: int, max_batches: Optional[int], delay: int):
+    """Process universe file in batches to avoid overwhelming the system."""
+    import time
+    
+    # Get API key from environment
+    api_key = os.getenv('POLYGON_API_KEY')
+    if not api_key:
+        click.echo("❌ POLYGON_API_KEY not found in environment", err=True)
+        raise click.Abort()
+    
+    # Load universe file
+    if os.getenv('DOCKER_ENV'):
+        # If in Docker, ensure path is correct
+        if not universe_file.startswith('/universe'):
+            universe_file = f"/universe/{os.path.basename(universe_file)}"
+    
+    # Initialize PolygonClient first
+    polygon_client = PolygonClient(api_key)
+    manager = UniverseManager(polygon_client)
+    
+    try:
+        universe_data = manager.load_universe(universe_file)
+        # Extract just the ticker symbols
+        tickers = [t['ticker'] if isinstance(t, dict) else t for t in universe_data.get('tickers', [])]
+        total_tickers = len(tickers)
+        total_batches = (total_tickers + batch_size - 1) // batch_size  # Ceiling division
+        
+        click.echo(f"📊 Processing {total_tickers} tickers in {total_batches} batches of {batch_size}")
+        
+        # Import the tasks
+        from app.tasks import discover_and_download_ticker
+        
+        # Determine ending batch
+        end_batch = min(start_batch + (max_batches or total_batches), total_batches)
+        
+        for batch_num in range(start_batch, end_batch):
+            batch_start = batch_num * batch_size
+            batch_end = min(batch_start + batch_size, total_tickers)
+            batch_tickers = tickers[batch_start:batch_end]
+            
+            click.echo(f"\n📦 Batch {batch_num + 1}/{total_batches}: {len(batch_tickers)} tickers")
+            click.echo(f"   Range: {batch_tickers[0]} to {batch_tickers[-1]}")
+            
+            # Enqueue tasks for this batch
+            task_ids = []
+            with click.progressbar(batch_tickers, label=f'Enqueueing batch {batch_num + 1}') as ticker_progress:
+                for ticker in ticker_progress:
+                    task = discover_and_download_ticker.delay(
+                        ticker=ticker,
+                        api_key=api_key
+                    )
+                    task_ids.append(task.id)
+            
+            click.echo(f"   ✅ Enqueued {len(task_ids)} tasks")
+            
+            # Delay between batches (except for the last one)
+            if batch_num + 1 < end_batch:
+                click.echo(f"   ⏳ Waiting {delay} seconds before next batch...")
+                time.sleep(delay)
+        
+        click.echo(f"\n✅ Successfully enqueued {end_batch - start_batch} batches")
+        click.echo(f"   Total tasks: {(end_batch - start_batch) * batch_size}")
+        click.echo(f"   Monitor with Flower UI at: http://localhost:5555")
+        
+        if end_batch < total_batches:
+            remaining = total_batches - end_batch
+            click.echo(f"\n💡 {remaining} batches remaining. Run with --start-batch {end_batch} to continue")
+    
+    except Exception as e:
+        click.echo(f"❌ Batch processing failed: {e}", err=True)
+        raise click.Abort()
 
 
 if __name__ == '__main__':

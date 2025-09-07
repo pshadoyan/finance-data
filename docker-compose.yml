@@ -34,6 +34,7 @@ services:
     networks:
       - finance-network
     environment:
+      - DOCKER_ENV=true
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
     command: python -m app.cli --help
@@ -56,6 +57,7 @@ services:
     networks:
       - finance-network
     environment:
+      - DOCKER_ENV=true
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
       - C_FORCE_ROOT=true
@@ -84,6 +86,7 @@ services:
     networks:
       - finance-network
     environment:
+      - DOCKER_ENV=true
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
       - C_FORCE_ROOT=true
@@ -111,6 +114,7 @@ services:
     networks:
       - finance-network
     environment:
+      - DOCKER_ENV=true
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
       - C_FORCE_ROOT=true
@@ -138,6 +142,7 @@ services:
     networks:
       - finance-network
     environment:
+      - DOCKER_ENV=true
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
       - C_FORCE_ROOT=true
@@ -165,6 +170,7 @@ services:
     networks:
       - finance-network
     environment:
+      - DOCKER_ENV=true
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
       - C_FORCE_ROOT=true
@@ -192,6 +198,7 @@ services:
     networks:
       - finance-network
     environment:
+      - DOCKER_ENV=true
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
       - C_FORCE_ROOT=true
@@ -201,6 +208,36 @@ services:
         limits:
           cpus: '1'
           memory: 1G
+
+  # FastAPI Web Service
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: finance-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./app:/app/app:ro
+      - ./data:/data
+      - ./universe:/universe
+    environment:
+      - DOCKER_ENV=true
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    env_file:
+      - .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - finance-network
+    command: uvicorn app.api.main:app --host 0.0.0.0 --port 8000 --reload
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   flower:
     build:
@@ -217,6 +254,7 @@ services:
     networks:
       - finance-network
     environment:
+      - DOCKER_ENV=true
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
     command: celery -A app.celery_app flower --port=5555

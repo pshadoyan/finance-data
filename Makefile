@@ -32,9 +32,11 @@ up: build
 	@echo "🚀 Starting services..."
 	docker-compose up -d redis
 	@sleep 3
-	docker-compose up -d flower
+	docker-compose up -d api flower
 	@sleep 2
 	@echo "✅ Services started!"
+	@echo "   SwaggerUI: http://localhost:8000/docs"
+	@echo "   FastAPI: http://localhost:8000"
 	@echo "   Flower UI: http://localhost:5555"
 	@echo "   Redis: localhost:6379"
 	@echo "   Run 'make workers' to start all workers"
@@ -50,9 +52,9 @@ stop:
 	@echo "⏸️  Pausing services..."
 	docker-compose stop
 
-# Full pipeline run
+# Full pipeline run (test mode with 100 tickers)
 run: up
-	@echo "🎯 Starting full pipeline with parallel processing..."
+	@echo "🎯 Starting full pipeline with parallel processing (TEST MODE - 100 tickers)..."
 	@sleep 5
 	@echo ""
 	@echo "👷 Step 1: Starting 6 parallel workers..."
@@ -79,6 +81,37 @@ run: up
 	@echo "   Monitor progress at http://localhost:5555"
 	@echo "   Run 'make logs' to see worker output"
 
+# Full production pipeline (ALL equities in batches)
+run-full: up
+	@echo "🚀 Starting FULL pipeline with ALL US equities..."
+	@sleep 5
+	@echo ""
+	@echo "👷 Step 1: Starting 6 parallel workers..."
+	docker-compose up -d worker-discovery worker-1 worker-2 worker-3 worker-4 worker-5
+	@echo "   ✓ 1 discovery worker + 5 download workers started"
+	@echo ""
+	@echo "📊 Step 2: Discovering ALL US equities (up to 15k tickers)..."
+	docker-compose run --rm app python -m app.cli discover-all
+	@echo ""
+	@echo "📦 Step 3: Processing in batches of 100..."
+	@UNIVERSE_FILE=$$(ls -t universe/us_equities_*.json 2>/dev/null | head -1); \
+	if [ -n "$$UNIVERSE_FILE" ]; then \
+		echo "   Using universe file: $$UNIVERSE_FILE"; \
+		echo "   Processing first 10 batches (1000 tickers)..."; \
+		echo "   Run 'make enqueue-batch START_BATCH=10' to continue with next batches"; \
+		docker-compose run --rm app python -m app.cli enqueue-batch $$UNIVERSE_FILE \
+			--batch-size 100 \
+			--start-batch 0 \
+			--max-batches 10 \
+			--delay 10; \
+	else \
+		echo "❌ No universe file found."; \
+	fi
+	@echo ""
+	@echo "✅ Full pipeline started!"
+	@echo "   Monitor progress at http://localhost:5555"
+	@echo "   Continue with: make enqueue-batch START_BATCH=10"
+
 # Run all workers (6 total: 1 discovery + 5 download)
 workers:
 	@echo "👷 Starting all workers..."
@@ -100,6 +133,25 @@ flower:
 	command -v open >/dev/null 2>&1 && open http://localhost:5555 || \
 	echo "Please open http://localhost:5555 in your browser"
 
+# Open API SwaggerUI
+api-docs:
+	@echo "📚 Opening API documentation..."
+	@command -v xdg-open >/dev/null 2>&1 && xdg-open http://localhost:8000/docs || \
+	command -v open >/dev/null 2>&1 && open http://localhost:8000/docs || \
+	echo "Please open http://localhost:8000/docs in your browser"
+
+# Start API service only
+api:
+	@echo "🌐 Starting API service..."
+	docker-compose up -d redis
+	@sleep 2
+	docker-compose up api
+
+# Check API health
+api-health:
+	@echo "🏥 Checking API health..."
+	@curl -s http://localhost:8000/health | python -m json.tool || echo "API not responding"
+
 # Show logs
 logs:
 	docker-compose logs -f --tail=100
@@ -115,10 +167,16 @@ clean:
 	rm -rf data/* universe/*
 	@echo "✅ Cleanup complete!"
 
-# Discover universe
+# Discover universe (limited for testing)
 discover:
-	@echo "🔍 Discovering US equities universe..."
+	@echo "🔍 Discovering US equities universe (limited to 100 for testing)..."
 	docker-compose run --rm app python -m app.cli discover us_equities --limit 100
+
+# Discover ALL US equities (up to 15k)
+discover-full:
+	@echo "🔍 Discovering ALL US equities (this may take a few minutes)..."
+	@echo "   Expected: ~15,000 tickers"
+	docker-compose run --rm app python -m app.cli discover-all
 
 # Discover all categories
 discover-all:
@@ -136,6 +194,24 @@ enqueue:
 		docker-compose run --rm app python -m app.cli enqueue $$UNIVERSE_FILE --async; \
 	else \
 		echo "❌ No universe file found. Run 'make discover' first."; \
+	fi
+
+# Enqueue in batches (for large universes)
+enqueue-batch:
+	@UNIVERSE_FILE=$$(ls -t universe/us_equities_*.json 2>/dev/null | head -1); \
+	if [ -n "$$UNIVERSE_FILE" ]; then \
+		echo "📦 Processing universe in batches..."; \
+		echo "   File: $$UNIVERSE_FILE"; \
+		echo "   Batch size: $${BATCH_SIZE:-100}"; \
+		echo "   Starting batch: $${START_BATCH:-0}"; \
+		echo "   Max batches: $${MAX_BATCHES:-10}"; \
+		docker-compose run --rm app python -m app.cli enqueue-batch $$UNIVERSE_FILE \
+			--batch-size $${BATCH_SIZE:-100} \
+			--start-batch $${START_BATCH:-0} \
+			--max-batches $${MAX_BATCHES:-10} \
+			--delay $${DELAY:-5}; \
+	else \
+		echo "❌ No universe file found. Run 'make discover' or 'make discover-full' first."; \
 	fi
 
 # Enqueue with specific parameters

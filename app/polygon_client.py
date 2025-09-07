@@ -161,16 +161,33 @@ class PolygonClient:
         
         # Map intervals to Polygon format - support ALL Polygon timeframes
         interval_mapping = {
+            # Seconds
+            "1s": ("second", 1),
+            "5s": ("second", 5),
+            "10s": ("second", 10),
+            "30s": ("second", 30),
+            # Minutes
             "1m": ("minute", 1),
+            "2m": ("minute", 2),
+            "3m": ("minute", 3),
             "5m": ("minute", 5),
+            "10m": ("minute", 10),
             "15m": ("minute", 15),
             "30m": ("minute", 30),
+            "45m": ("minute", 45),
+            # Hours
             "1h": ("hour", 1),
             "2h": ("hour", 2),
+            "3h": ("hour", 3),
             "4h": ("hour", 4),
+            "6h": ("hour", 6),
+            "8h": ("hour", 8),
+            "12h": ("hour", 12),
+            # Daily and above
             "1d": ("day", 1),
             "1w": ("week", 1),
             "1M": ("month", 1),
+            "3M": ("month", 3),
             "1Q": ("quarter", 1),
             "1Y": ("year", 1)
         }
@@ -281,17 +298,20 @@ class PolygonClient:
             timespan, multiplier = interval_mapping[interval]
             
             # Try to get the earliest available data
-            # Start with IPO date if available, otherwise use a very early date
+            # Polygon API requires dates after Unix epoch (1970-01-01)
             ticker_details = None
             try:
                 ticker_details = self.get_ticker_details(ticker)
                 list_date = ticker_details.get('list_date')
-                if list_date:
+                if list_date and list_date > "1970-01-01":
+                    # Use IPO date if it's after Unix epoch
                     start_probe = list_date
                 else:
-                    start_probe = "2000-01-01"
+                    # Probe from 1970 (Unix epoch start)
+                    start_probe = "1970-01-01"
             except:
-                start_probe = "2000-01-01"
+                # Default to Unix epoch for maximum historical coverage
+                start_probe = "1970-01-01"
             
             # Get today's date as end probe
             end_probe = datetime.now().strftime('%Y-%m-%d')
@@ -406,19 +426,39 @@ class PolygonClient:
         
         available_timeframes = {}
         
-        # Check all possible timeframe combinations
-        # Polygon supports: minute (1, 5, 15, 30, 45), hour (1, 2, 4), day, week, month, quarter, year
+        # Check commonly used timeframe combinations
+        # Polygon supports any multiplier with: second, minute, hour, day, week, month, quarter, year
         timeframes_to_check = [
+            # Seconds (for high-frequency data)
+            ("second", 1, "1s"),
+            ("second", 5, "5s"),
+            ("second", 10, "10s"),
+            ("second", 30, "30s"),
+            
+            # Minutes (most common intraday)
             ("minute", 1, "1m"),
+            ("minute", 2, "2m"),
+            ("minute", 3, "3m"),
             ("minute", 5, "5m"),
+            ("minute", 10, "10m"),
             ("minute", 15, "15m"),
             ("minute", 30, "30m"),
+            ("minute", 45, "45m"),
+            
+            # Hours
             ("hour", 1, "1h"),
             ("hour", 2, "2h"),
+            ("hour", 3, "3h"),
             ("hour", 4, "4h"),
+            ("hour", 6, "6h"),
+            ("hour", 8, "8h"),
+            ("hour", 12, "12h"),
+            
+            # Daily and above
             ("day", 1, "1d"),
             ("week", 1, "1w"),
             ("month", 1, "1M"),
+            ("month", 3, "3M"),  # Quarterly alternative
             ("quarter", 1, "1Q"),
             ("year", 1, "1Y")
         ]
@@ -443,9 +483,10 @@ class PolygonClient:
             "available_timeframes": available_timeframes,
             "total_timeframes": len(available_timeframes),
             "market_type": market_type,
-            "has_intraday": any(tf in available_timeframes for tf in ["1m", "5m", "15m", "30m"]),
-            "has_hourly": any(tf in available_timeframes for tf in ["1h", "2h", "4h"]),
-            "has_daily": any(tf in available_timeframes for tf in ["1d", "1w", "1M", "1Q", "1Y"])
+            "has_seconds": any(tf in available_timeframes for tf in ["1s", "5s", "10s", "30s"]),
+            "has_intraday": any(tf in available_timeframes for tf in ["1m", "2m", "3m", "5m", "10m", "15m", "30m", "45m"]),
+            "has_hourly": any(tf in available_timeframes for tf in ["1h", "2h", "3h", "4h", "6h", "8h", "12h"]),
+            "has_daily": any(tf in available_timeframes for tf in ["1d", "1w", "1M", "3M", "1Q", "1Y"])
         }
     
     def _check_timeframe_availability(self, ticker: str, timespan: str, multiplier: int) -> Optional[Dict[str, Any]]:
@@ -461,9 +502,10 @@ class PolygonClient:
             Dict with date range info if available, None otherwise
         """
         try:
-            # Use a wide date range to check availability
+            # Use a wide date range to check available history
+            # Polygon API requires dates after Unix epoch (1970-01-01)
             end_date = datetime.now().strftime('%Y-%m-%d')
-            start_date = "2000-01-01"
+            start_date = "1970-01-01"
             
             # Try to get just one bar to check availability
             bars_resp = self.client.list_aggs(

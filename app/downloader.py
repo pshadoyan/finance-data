@@ -24,8 +24,8 @@ class DataDownloader:
         
     def _get_ticker_dir(self, ticker: str) -> Path:
         """Get the directory for a specific ticker."""
-        ticker_dir = self.data_dir / ticker.upper()
-        ticker_dir.mkdir(exist_ok=True)
+        ticker_dir = self.data_dir / "equities" / ticker.upper()
+        ticker_dir.mkdir(parents=True, exist_ok=True)
         return ticker_dir
     
     def _get_file_path(self, ticker: str, interval: str, output_format: str = "parquet") -> Path:
@@ -154,7 +154,9 @@ class DataDownloader:
         
         # Fallback to defaults if still None
         if start_date is None:
-            start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+            # Default to getting ALL available history (from Unix epoch)
+            # Polygon API requires dates after 1970-01-01
+            start_date = "1970-01-01"
         if end_date is None:
             end_date = datetime.now().strftime('%Y-%m-%d')
         
@@ -169,16 +171,19 @@ class DataDownloader:
             last_timestamp = self._get_last_timestamp(existing_df)
             if last_timestamp:
                 # Calculate appropriate resume date based on interval
-                if interval in ["1m", "5m", "15m", "30m"]:
+                if interval in ["1s", "5s", "10s", "30s"]:
+                    # For second intervals, resume from next second
+                    resume_date = (last_timestamp + timedelta(seconds=1)).strftime('%Y-%m-%d %H:%M:%S')
+                elif interval in ["1m", "2m", "3m", "5m", "10m", "15m", "30m", "45m"]:
                     # For minute intervals, resume from next minute
                     resume_date = (last_timestamp + timedelta(minutes=1)).strftime('%Y-%m-%d')
-                elif interval in ["1h", "2h", "4h"]:
+                elif interval in ["1h", "2h", "3h", "4h", "6h", "8h", "12h"]:
                     # For hour intervals, resume from next hour
                     resume_date = (last_timestamp + timedelta(hours=1)).strftime('%Y-%m-%d')
                 elif interval == "1w":
                     # For weekly, resume from next week
                     resume_date = (last_timestamp + timedelta(weeks=1)).strftime('%Y-%m-%d')
-                elif interval == "1M":
+                elif interval in ["1M", "3M"]:
                     # For monthly, resume from next month
                     resume_date = (last_timestamp + timedelta(days=31)).strftime('%Y-%m-%d')
                 elif interval == "1Q":
@@ -364,7 +369,7 @@ class DataDownloader:
             ticker: Stock ticker symbol
             output_format: Output format
             force_refresh: Force refresh all data
-            organize: Use DataOrganizer to structure output
+            organize: Deprecated parameter (kept for compatibility)
             
         Returns:
             Comprehensive download results
@@ -406,42 +411,12 @@ class DataDownloader:
                 success_count += 1
                 total_records += result.get('new_records', 0)
         
-        # Organize the downloaded data if requested
-        if organize and success_count > 0:
-            try:
-                from app.data_organizer import DataOrganizer
-                organizer = DataOrganizer(self.data_dir)
-                
-                for result in download_results:
-                    if result['status'] == 'success' and 'file_path' in result:
-                        file_path = Path(result['file_path'])
-                        if file_path.exists():
-                            organized_path = organizer.organize_downloaded_file(
-                                source_file=file_path,
-                                symbol=ticker,
-                                interval=result['interval'],
-                                market_type=timeframe_info['market_type'],
-                                data_source='rest_api',
-                                partition_by_year=True
-                            )
-                            result['organized_path'] = str(organized_path)
-                            
-                            # Clean up the original file if it was moved
-                            if not file_path.exists() and file_path.parent.exists():
-                                # Remove empty ticker directory
-                                try:
-                                    file_path.parent.rmdir()  # Only removes if empty
-                                except OSError:
-                                    pass  # Directory not empty, leave it
-                
-                # Generate summary report
-                summary = organizer.get_data_summary()
-                
-            except Exception as e:
-                logger.warning(f"Could not organize data: {e}")
-                summary = None
-        else:
-            summary = None
+        # No organization needed - data is already saved to equities/TICKER/
+        summary = {
+            "files_downloaded": success_count,
+            "total_records": total_records,
+            "data_location": f"{self.data_dir}/equities/{ticker}/"
+        }
         
         return {
             "ticker": ticker,
